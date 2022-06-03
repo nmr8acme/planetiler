@@ -336,7 +336,7 @@ public class Place implements
     PlaceType placeType = PlaceType.forName(element.place());
 
     int minzoom = rank != null && rank == 1 ? 2 :
-      rank != null && rank <= 8 ? Math.max(3, rank - 1) :
+      rank != null && rank <= 5 ? Math.max(3, rank - 1) :
       placeType.ordinal() <= PlaceType.TOWN.ordinal() ? 4 :
       placeType.ordinal() <= PlaceType.VILLAGE.ordinal() ? 8 :
       placeType.ordinal() <= PlaceType.SUBURB.ordinal() ? 11 : 14;

@@ -435,7 +435,7 @@ class PlaceTest extends AbstractLayerTest {
 
   @Test
   void testCityWithoutNaturalEarthMatch() {
-      assertFeatures(6, List.of(Map.of(
+    assertFeatures(6, List.of(Map.of(
       "_layer", "place",
       "class", "city",
       "rank", "<null>",
@@ -499,6 +499,17 @@ class PlaceTest extends AbstractLayerTest {
       "ne_10m_populated_places",
       0
     ));
+    process(SimpleFeature.create(
+      newPoint(0, 10),
+      Map.of(
+        "name", "Test2",
+        "scalerank", 7,
+        "wikidataid", "Q123"
+      ),
+      NATURAL_EARTH_SOURCE,
+      "ne_10m_populated_places",
+      0
+    ));
     // without natural earth data
     assertFeatures(7, List.of(Map.of(
       "_layer", "place",
@@ -524,6 +535,19 @@ class PlaceTest extends AbstractLayerTest {
         "place", "town",
         "name", "Test",
         "wikidataid", "Q985636",
+        "population", "35999"
+      ))));
+    assertFeatures(5, List.of(Map.of(
+      "_layer", "place",
+      "class", "town",
+      "name", "Test2",
+      "_type", "point",
+      "_minzoom", 4
+    )), process(pointFeature(
+      Map.of(
+        "place", "town",
+        "name", "Test2",
+        "wikidataid", "Q123",
         "population", "35999"
       ))));
   }

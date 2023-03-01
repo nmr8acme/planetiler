@@ -231,7 +231,7 @@ public class FeatureCollector implements Iterable<FeatureCollector.Feature> {
     private Feature(String layer, Geometry geom, long sourceId) {
       this.layer = layer;
       this.geom = geom;
-      this.geometryType = GeometryType.valueOf(geom);
+      this.geometryType = GeometryType.typeOf(geom);
       this.sourceId = sourceId;
     }
 
@@ -367,7 +367,7 @@ public class FeatureCollector implements Iterable<FeatureCollector.Feature> {
      * features to emit.
      */
     public double getMinPixelSizeAtZoom(int zoom) {
-      return zoom == config.maxzoom() ? minPixelSizeAtMaxZoom :
+      return zoom == config.maxzoomForRendering() ? minPixelSizeAtMaxZoom :
         ZoomFunction.applyAsDoubleOrElse(minPixelSize, zoom, defaultMinPixelSize);
     }
 
@@ -406,7 +406,7 @@ public class FeatureCollector implements Iterable<FeatureCollector.Feature> {
      * {@link ZoomFunction} explicitly and pass it to {@link #setMinPixelSizeOverrides(ZoomFunction)}.
      */
     public Feature setMinPixelSizeBelowZoom(int zoom, double minPixelSize) {
-      if (zoom >= config.maxzoom()) {
+      if (zoom >= config.maxzoomForRendering()) {
         minPixelSizeAtMaxZoom = minPixelSize;
       }
       this.minPixelSize = ZoomFunction.maxZoom(zoom, minPixelSize);
@@ -443,7 +443,7 @@ public class FeatureCollector implements Iterable<FeatureCollector.Feature> {
      * Returns the simplification tolerance for lines and polygons in tile pixels at {@code zoom}.
      */
     public double getPixelToleranceAtZoom(int zoom) {
-      return zoom == config.maxzoom() ? pixelToleranceAtMaxZoom :
+      return zoom == config.maxzoomForRendering() ? pixelToleranceAtMaxZoom :
         ZoomFunction.applyAsDoubleOrElse(pixelTolerance, zoom, defaultPixelTolerance);
     }
 
@@ -504,7 +504,7 @@ public class FeatureCollector implements Iterable<FeatureCollector.Feature> {
      * {@link ZoomFunction} explicitly and pass it to {@link #setPixelToleranceOverrides(ZoomFunction)}
      */
     public Feature setPixelToleranceBelowZoom(int zoom, double tolerance) {
-      if (zoom == config.maxzoom()) {
+      if (zoom == config.maxzoomForRendering()) {
         pixelToleranceAtMaxZoom = tolerance;
       }
       return setPixelToleranceOverrides(ZoomFunction.maxZoom(zoom, tolerance));
@@ -634,7 +634,7 @@ public class FeatureCollector implements Iterable<FeatureCollector.Feature> {
         return attrs;
       }
       if (attrCache == null) {
-        attrCache = CacheByZoom.create(config, this::computeAttrsAtZoom);
+        attrCache = CacheByZoom.create(this::computeAttrsAtZoom);
       }
       return attrCache.get(zoom);
     }

@@ -24,22 +24,27 @@ import com.onthegomap.planetiler.mbtiles.Verify;
 import com.onthegomap.planetiler.reader.SourceFeature;
 import com.onthegomap.planetiler.stats.Stats;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.apache.commons.lang3.reflect.FieldUtils;
 import org.locationtech.jts.algorithm.Orientation;
 import org.locationtech.jts.geom.Coordinate;
 import org.locationtech.jts.geom.CoordinateSequence;
@@ -315,6 +320,23 @@ public class TestUtils {
     Path cwd = Path.of("").toAbsolutePath();
     Path pathFromRoot = Path.of("planetiler-core", "src", "test", "resources", resource);
     return cwd.resolveSibling(pathFromRoot);
+  }
+
+  public static Path extractPathToResource(Path tempDir, String resource) {
+    return extractPathToResource(tempDir, resource, resource);
+  }
+
+  public static Path extractPathToResource(Path tempDir, String resource, String local) {
+    var path = tempDir.resolve(resource);
+    try (
+      var input = TestUtils.class.getResourceAsStream("/" + resource);
+      var output = Files.newOutputStream(path);
+    ) {
+      Objects.requireNonNull(input, "Could not find " + resource + " on classpath").transferTo(output);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    return path;
   }
 
   public interface GeometryComparision {
@@ -601,6 +623,18 @@ public class TestUtils {
     }
   }
 
+  public static void assertMinFeatureCount(Mbtiles db, String layer, int zoom, Map<String, Object> attrs,
+    Envelope envelope, int expected, Class<? extends Geometry> clazz) {
+    try {
+      int num = Verify.getNumFeatures(db, layer, zoom, attrs, envelope, clazz);
+
+      assertTrue(expected < num,
+        "z%d features in %s, expected at least %d got %d".formatted(zoom, layer, expected, num));
+    } catch (GeometryException e) {
+      fail(e);
+    }
+  }
+
   public static void assertFeatureNear(Mbtiles db, String layer, Map<String, Object> attrs, double lng, double lat,
     int minzoom, int maxzoom) {
     try {
@@ -651,6 +685,35 @@ public class TestUtils {
         fail(String.join(System.lineSeparator(), failures));
       }
     } catch (GeometryException | IOException e) {
+      fail(e);
+    }
+  }
+
+  public static void assertTileDuplicates(Mbtiles db, int expected) {
+    try {
+      Connection connection = (Connection) FieldUtils.readField(db, "connection", true);
+      Statement statement = connection.createStatement();
+      ResultSet rs = statement.executeQuery("SELECT tile_data FROM tiles_data");
+      ArrayList<byte[]> tilesList = new ArrayList<>();
+      while (rs.next()) {
+        tilesList.add(rs.getBytes("tile_data"));
+      }
+
+      var tiles = tilesList.toArray(new byte[0][0]);
+      Set<Integer> dups = new HashSet<>();
+      for (int i = 0; i < tiles.length; i++) {
+        for (int j = i + 1; j < tiles.length; j++) {
+          if (Arrays.equals(tiles[i], tiles[j])) {
+            if (!dups.contains(j)) {
+              dups.add(j);
+            }
+          }
+        }
+      }
+
+      int dupCount = dups.size();
+      assertEquals(expected, dupCount, "%d duplicates expected, %d found".formatted(expected, dupCount));
+    } catch (IllegalAccessException | SQLException e) {
       fail(e);
     }
   }

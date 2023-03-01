@@ -13,7 +13,7 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: write
       packages: write
@@ -26,6 +26,8 @@ jobs:
             version = context.payload.inputs.version;
             if (/^v/.test(version)) throw new Error("Bad version number: " + version)
       - uses: actions/checkout@v3
+        with:
+          submodules: true
       - name: Cache data/sources
         uses: ./.github/cache-sources-action
       - uses: actions/setup-java@v3

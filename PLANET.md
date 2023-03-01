@@ -1,7 +1,9 @@
 # Generating a Map of the World
 
-To generate a map of the world using the built-in [basemap profile](planetiler-basemap), you will need a machine with
-Java 16 or later installed and at least 10x as much disk space and at least 0.5x as much RAM as the `planet.osm.pbf`
+To generate a map of the world using the
+built-in [OpenMapTiles profile](https://github.com/openmaptiles/planetiler-openmaptiles), you will need a
+machine with
+Java 17 or later installed and at least 10x as much disk space and at least 0.5x as much RAM as the `planet.osm.pbf`
 file you start from. All testing has been done using Digital Ocean droplets with dedicated
 vCPUs ([referral link](https://m.do.co/c/a947e99aab25)) and OpenJDK 17 installed through `apt`. Planetiler splits work
 among available CPUs so the more you have, the less time it takes.
@@ -19,6 +21,12 @@ First decide where to get the `planet.osm.pbf` file:
   ```bash
   osmium apply-changes daylight.osm.pbf admin.osc.bz2 <buildings.osc.bz2, ...> -o everything.osm.pbf
   osmium renumber everything.osm.pbf -o planet.osm.pbf
+  ```
+- If you would like to update your `planet.osm.pbf` file to the latest changes from OpenStreetMap, you can
+  use [pyosmium-up-to-date](https://docs.osmcode.org/pyosmium/latest/tools_uptodate.html):
+
+  ```bash
+  pyosmium-up-to-date --size 20000 -v planet.osm.pbf
   ```
 
   NOTE: you need at least `admin.osc.bz2` for the `boundary` layer to show. This takes about 2.5 hours and needs as much
@@ -66,7 +74,7 @@ java -Xmx20g \
 
 Run with `--help` to see all available arguments.
 
-NOTE: The default basemap profile merges nearby buildings at zoom-level 13 (for example,
+NOTE: The default OpenMapTiles profile merges nearby buildings at zoom-level 13 (for example,
 see [Boston](https://onthegomap.github.io/planetiler-demo/#13.08/42.35474/-71.06597)). This adds about 14 CPU hours (~50
 minutes with 16 CPUs) to planet generation time and can be disabled using `--building-merge-z13=false`.
 

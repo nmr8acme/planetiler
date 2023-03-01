@@ -1,5 +1,7 @@
 package com.onthegomap.planetiler.config;
 
+import com.google.common.collect.HashMultiset;
+import com.google.common.collect.Multiset;
 import com.onthegomap.planetiler.geo.GeoUtils;
 import com.onthegomap.planetiler.stats.Stats;
 import java.io.IOException;
@@ -8,13 +10,16 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.TreeMap;
-import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
 import org.locationtech.jts.geom.Envelope;
 import org.slf4j.Logger;
@@ -28,10 +33,22 @@ public class Arguments {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(Arguments.class);
 
-  private final Function<String, String> provider;
+  private final UnaryOperator<String> provider;
+  private final Supplier<? extends Collection<String>> keys;
+  private boolean silent = false;
 
-  private Arguments(Function<String, String> provider) {
+  private Arguments(UnaryOperator<String> provider, Supplier<? extends Collection<String>> keys) {
     this.provider = provider;
+    this.keys = keys;
+  }
+
+  private static Arguments from(UnaryOperator<String> provider, Supplier<? extends Collection<String>> rawKeys,
+    UnaryOperator<String> forward, UnaryOperator<String> reverse) {
+    Supplier<List<String>> keys = () -> rawKeys.get().stream().flatMap(key -> {
+      String reversed = reverse.apply(key);
+      return key.equalsIgnoreCase(reversed) ? Stream.empty() : Stream.of(reversed);
+    }).toList();
+    return new Arguments(key -> provider.apply(forward.apply(key)), keys);
   }
 
   /**
@@ -40,7 +57,17 @@ public class Arguments {
    * For example to set {@code key=value}: {@code java -Dplanetiler.key=value -jar ...}
    */
   public static Arguments fromJvmProperties() {
-    return new Arguments(key -> System.getProperty("planetiler." + key));
+    return fromJvmProperties(
+      System::getProperty,
+      () -> System.getProperties().stringPropertyNames()
+    );
+  }
+
+  static Arguments fromJvmProperties(UnaryOperator<String> getter, Supplier<? extends Collection<String>> keys) {
+    return from(getter, keys,
+      key -> "planetiler." + key.toLowerCase(Locale.ROOT),
+      key -> key.replaceFirst("^planetiler\\.", "").toLowerCase(Locale.ROOT)
+    );
   }
 
   /**
@@ -49,13 +76,33 @@ public class Arguments {
    * For example to set {@code key=value}: {@code PLANETILER_KEY=value java -jar ...}
    */
   public static Arguments fromEnvironment() {
-    return new Arguments(key -> System.getenv("PLANETILER_" + key.toUpperCase(Locale.ROOT)));
+    return fromEnvironment(
+      System::getenv,
+      () -> System.getenv().keySet()
+    );
+  }
+
+  static Arguments fromEnvironment(UnaryOperator<String> getter, Supplier<Set<String>> keys) {
+    return from(getter, keys,
+      key -> "PLANETILER_" + key.toUpperCase(Locale.ROOT),
+      key -> key.replaceFirst("^PLANETILER_", "").toLowerCase(Locale.ROOT)
+    );
+  }
+
+  /**
+   * Returns arguments parsed from a {@link Properties} object.
+   */
+  public static Arguments from(Properties properties) {
+    return new Arguments(
+      properties::getProperty,
+      properties::stringPropertyNames
+    );
   }
 
   /**
    * Returns arguments parsed from command-line arguments.
    * <p>
-   * For example to set {@code key=value}: {@code java -jar ... key=value}
+   * For example to set {@code key=value}: {@code java -jar ... key=value} or {@code java -jar ... --key value}
    * <p>
    * Or to set {@code key=true}: {@code java -jar ... --key}
    *
@@ -64,14 +111,23 @@ public class Arguments {
    */
   public static Arguments fromArgs(String... args) {
     Map<String, String> parsed = new HashMap<>();
-    for (String arg : args) {
+    for (int i = 0; i < args.length; i++) {
+      String arg = args[i].strip();
       String[] kv = arg.split("=", 2);
+      String key = kv[0].replaceAll("^[\\s-]+", "");
       if (kv.length == 2) {
-        String key = kv[0].replaceAll("^[\\s-]+", "");
         String value = kv[1];
         parsed.put(key, value);
       } else if (kv.length == 1) {
-        parsed.put(kv[0].replaceAll("^[\\s-]+", ""), "true");
+        if (arg.startsWith("-")) {
+          if (i >= args.length - 1 || args[i + 1].strip().startsWith("-")) {
+            parsed.put(key, "true");
+          } else {
+            parsed.put(key, args[++i].strip());
+          }
+        } else {
+          parsed.put(key, "true");
+        }
       }
     }
     return of(parsed);
@@ -86,7 +142,7 @@ public class Arguments {
     Properties properties = new Properties();
     try (var reader = Files.newBufferedReader(path)) {
       properties.load(reader);
-      return new Arguments(properties::getProperty);
+      return from(properties);
     } catch (IOException e) {
       throw new IllegalArgumentException("Unable to load config file: " + path, e);
     }
@@ -107,9 +163,7 @@ public class Arguments {
    * @return arguments parsed from those sources
    */
   public static Arguments fromArgsOrConfigFile(String... args) {
-    Arguments fromArgsOrEnv = fromArgs(args)
-      .orElse(fromJvmProperties())
-      .orElse(fromEnvironment());
+    Arguments fromArgsOrEnv = fromEnvOrArgs(args);
     Path configFile = fromArgsOrEnv.file("config", "path to config file", null);
     if (configFile != null) {
       return fromArgsOrEnv.orElse(fromConfigFile(configFile));
@@ -118,8 +172,27 @@ public class Arguments {
     }
   }
 
+  /**
+   * Returns arguments parsed from command-line arguments, JVM properties, environmental variables.
+   * <p>
+   * Priority order:
+   * <ol>
+   * <li>command-line arguments: {@code java ... key=value}</li>
+   * <li>jvm properties: {@code java -Dplanetiler.key=value ...}</li>
+   * <li>environmental variables: {@code PLANETILER_KEY=value java ...}</li>
+   * </ol>
+   *
+   * @param args command-line args provide to main entrypoint method
+   * @return arguments parsed from those sources
+   */
+  public static Arguments fromEnvOrArgs(String... args) {
+    return fromArgs(args)
+      .orElse(fromJvmProperties())
+      .orElse(fromEnvironment());
+  }
+
   public static Arguments of(Map<String, String> map) {
-    return new Arguments(map::get);
+    return new Arguments(map::get, map::keySet);
   }
 
   /** Shorthand for {@link #of(Map)} which constructs the map from a list of key/value pairs. */
@@ -149,10 +222,20 @@ public class Arguments {
    * @return arguments instance that checks {@code this} first and if a match is not found then {@code other}
    */
   public Arguments orElse(Arguments other) {
-    return new Arguments(key -> {
-      String ourResult = get(key);
-      return ourResult != null ? ourResult : other.get(key);
-    });
+    var result = new Arguments(
+      key -> {
+        String ourResult = get(key);
+        return ourResult != null ? ourResult : other.get(key);
+      },
+      () -> Stream.concat(
+        other.keys.get().stream(),
+        keys.get().stream()
+      ).distinct().toList()
+    );
+    if (silent) {
+      result.silence();
+    }
+    return result;
   }
 
   String getArg(String key) {
@@ -190,8 +273,16 @@ public class Arguments {
     return result;
   }
 
-  private void logArgValue(String key, String description, Object result) {
-    LOGGER.debug("argument: " + key + "=" + result + " (" + description + ")");
+  protected void logArgValue(String key, String description, Object result) {
+    if (!silent) {
+      LOGGER.debug("argument: {}={} ({})", key, result, description);
+    }
+  }
+
+  /** Stop logging argument values when they are read and return this instance. */
+  public Arguments silence() {
+    this.silent = true;
+    return this;
   }
 
   public String getString(String key, String description, String defaultValue) {
@@ -200,12 +291,34 @@ public class Arguments {
     return value;
   }
 
-  /** Returns a {@link Path} parsed from {@code key} argument which may or may not exist. */
+  public String getString(String key, String description) {
+    String value = getRequiredArg(key, description);
+    logArgValue(key, description, value);
+    return value;
+  }
+
+  /** Returns a {@link Path} parsed from {@code key} argument, or fall back to a default if the argument is not set. */
   public Path file(String key, String description, Path defaultValue) {
     String value = getArg(key);
     Path file = value == null ? defaultValue : Path.of(value);
     logArgValue(key, description, file);
     return file;
+  }
+
+  /** Returns a {@link Path} parsed from {@code key} argument which may or may not exist. */
+  public Path file(String key, String description) {
+    String value = getRequiredArg(key, description);
+    Path file = Path.of(value);
+    logArgValue(key, description, file);
+    return file;
+  }
+
+  private String getRequiredArg(String key, String description) {
+    String value = getArg(key);
+    if (value == null) {
+      throw new IllegalArgumentException("Missing required parameter: " + key + " (" + description + ")");
+    }
+    return value;
   }
 
   /**
@@ -221,9 +334,30 @@ public class Arguments {
     return path;
   }
 
+  /**
+   * Returns a {@link Path} parsed from a required {@code key} argument which must exist for the program to function.
+   *
+   * @throws IllegalArgumentException if the file does not exist or if the parameter is not provided.
+   */
+  public Path inputFile(String key, String description) {
+    Path path = file(key, description);
+    if (!Files.exists(path)) {
+      throw new IllegalArgumentException(path + " does not exist");
+    }
+    return path;
+  }
+
   /** Returns a boolean parsed from {@code key} argument where {@code "true"} is true and anything else is false. */
   public boolean getBoolean(String key, String description, boolean defaultValue) {
     boolean value = "true".equalsIgnoreCase(getArg(key, Boolean.toString(defaultValue)));
+    logArgValue(key, description, value);
+    return value;
+  }
+
+  /** Returns a boolean parsed from {@code key} or {@code null} if not specified. */
+  public Boolean getBooleanObject(String key, String description) {
+    var arg = getArg(key);
+    Boolean value = arg == null ? null : "true".equalsIgnoreCase(arg);
     logArgValue(key, description, value);
     return value;
   }
@@ -261,13 +395,13 @@ public class Arguments {
   public Stats getStats() {
     String prometheus = getArg("pushgateway");
     if (prometheus != null && !prometheus.isBlank()) {
-      LOGGER.info("Using prometheus push gateway stats");
+      LOGGER.info("argument: stats=use prometheus push gateway stats");
       String job = getString("pushgateway.job", "prometheus pushgateway job ID", "planetiler");
       Duration interval = getDuration("pushgateway.interval", "how often to send stats to prometheus push gateway",
         "15s");
       return Stats.prometheusPushGateway(prometheus, job, interval);
     } else {
-      LOGGER.info("Using in-memory stats");
+      LOGGER.info("argument: stats=use in-memory stats");
       return Stats.inMemory();
     }
   }
@@ -318,5 +452,36 @@ public class Arguments {
     long parsed = Long.parseLong(value);
     logArgValue(key, description, parsed);
     return parsed;
+  }
+
+  /**
+   * Returns a map from all the arguments provided to their values.
+   */
+  public Map<String, String> toMap() {
+    Map<String, String> result = new HashMap<>();
+    for (var key : keys.get()) {
+      result.put(key, get(key));
+    }
+    return result;
+  }
+
+  /** Returns a copy of this {@code Arguments} instance that logs each extracted argument value exactly once. */
+  public Arguments withExactlyOnceLogging() {
+    Multiset<String> logged = HashMultiset.create();
+    return new Arguments(this.provider, this.keys) {
+      @Override
+      protected void logArgValue(String key, String description, Object result) {
+        int count = logged.add(key, 1);
+        if (count == 0) {
+          super.logArgValue(key, description, result);
+        } else if (count == 3000) {
+          LOGGER.warn("Too many requests for argument '{}', result should be cached", key);
+        }
+      }
+    };
+  }
+
+  public boolean silenced() {
+    return silent;
   }
 }

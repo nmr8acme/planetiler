@@ -2,11 +2,13 @@ package com.onthegomap.planetiler.config;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import com.onthegomap.planetiler.ExpectedException;
 import com.onthegomap.planetiler.TestUtils;
 import com.onthegomap.planetiler.reader.osm.OsmInputFile;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.locationtech.jts.geom.Envelope;
 
@@ -136,7 +138,7 @@ class ArgumentsTest {
       new Bounds(Arguments.of("bounds", "world").bounds("bounds", "bounds")).latLon());
     assertEquals(new Envelope(7.409205, 7.448637, 43.72335, 43.75169),
       new Bounds(Arguments.of().bounds("bounds", "bounds"))
-        .setFallbackProvider(new OsmInputFile(TestUtils.pathToResource("monaco-latest.osm.pbf")))
+        .addFallbackProvider(new OsmInputFile(TestUtils.pathToResource("monaco-latest.osm.pbf")))
         .latLon());
   }
 
@@ -168,5 +170,127 @@ class ArgumentsTest {
     assertTrue(Arguments.fromArgs(
       "--force_download=true"
     ).getBoolean("force_download", "force", false));
+  }
+
+  @Test
+  void testSpaceBetweenArgs() {
+    Arguments args = Arguments.fromArgs(
+      "--key value --key2 value2 --force1 --force2".split("\\s+")
+    );
+
+    assertEquals("value", args.getString("key", "key", null));
+    assertEquals("value2", args.getString("key2", "key2", null));
+    assertTrue(args.getBoolean("force1", "force1", false));
+    assertTrue(args.getBoolean("force2", "force2", false));
+  }
+
+  @Test
+  void testListArgumentValuesFromCommandLine() {
+    assertEquals(Map.of(), Arguments.fromArgs().toMap());
+    assertEquals(Map.of(
+      "key", "value",
+      "key2", "value2",
+      "force1", "true",
+      "force2", "true"
+    ), Arguments.fromArgs(
+      "--key value --key2 value2 --force1 --force2".split("\\s+")
+    ).toMap());
+  }
+
+  @Test
+  void testListArgumentValuesFromMap() {
+    assertEquals(Map.of(), Arguments.of(Map.of()).toMap());
+    assertEquals(Map.of("a", "1", "b", "2"), Arguments.of(Map.of("a", "1", "b", "2")).toMap());
+  }
+
+  @Test
+  void testListArgumentValuesFromConfigFile() {
+    Arguments args = Arguments.fromConfigFile(TestUtils.pathToResource("test.properties"));
+    assertEquals(Map.of("key1", "value1fromfile", "key2", "value2fromfile"), args.toMap());
+  }
+
+  @Test
+  void testListArgumentsFromEnvironment() {
+    Map<String, String> env = Map.of(
+      "OTHER", "value",
+      "PLANETILEROTHER", "VALUE",
+      "PLANETILER_KEY1", "value1",
+      "PLANETILER_KEY2", "value2"
+    );
+    Arguments args = Arguments.fromEnvironment(env::get, env::keySet);
+    assertEquals(Map.of(
+      "key1", "value1",
+      "key2", "value2"
+    ), args.toMap());
+  }
+
+  @Test
+  void testListArgumentsFromJvmProperties() {
+    Map<String, String> jvm = Map.of(
+      "OTHER", "value",
+      "PLANETILEROTHER", "VALUE",
+      "PLANETILER_KEY1", "value1",
+      "PLANETILER_KEY2", "value2",
+      "planetiler.key3", "value4"
+    );
+    Arguments args = Arguments.fromJvmProperties(jvm::get, jvm::keySet);
+    assertEquals(Map.of(
+      "key3", "value4"
+    ), args.toMap());
+  }
+
+  @Test
+  void testListArgumentsFromMerged() {
+    Map<String, String> env = Map.of(
+      "OTHER", "value",
+      "PLANETILEROTHER", "VALUE",
+      "PLANETILER_KEY1", "value1",
+      "PLANETILER_KEY2", "value2",
+      "planetiler.key3", "value3"
+    );
+    Map<String, String> jvm = Map.of(
+      "other", "value",
+      "PLANETILEROTHER", "VALUE",
+      "PLANETILER_KEY1", "value1",
+      "PLANETILER_KEY2", "value2",
+      "planetiler.key3", "value4"
+    );
+    Arguments args = Arguments.fromJvmProperties(jvm::get, jvm::keySet)
+      .orElse(Arguments.fromEnvironment(env::get, env::keySet));
+    assertEquals(Map.of(
+      "key3", "value4",
+      "key1", "value1",
+      "key2", "value2"
+    ), args.toMap());
+  }
+
+  @Test
+  void testDontAccessArgListUntilUsed() {
+    Map<String, String> env = Map.of(
+      "OTHER", "value",
+      "PLANETILEROTHER", "VALUE",
+      "PLANETILER_KEY1", "value1",
+      "PLANETILER_KEY2", "value2",
+      "planetiler.key3", "value3"
+    );
+    Arguments args = Arguments.fromEnvironment(env::get, () -> {
+      throw new ExpectedException();
+    });
+    assertEquals("value1", args.getString("key1", ""));
+    assertThrows(ExpectedException.class, args::toMap);
+  }
+
+  @Test
+  void testBooleanObject() {
+    Map<String, String> env = Map.of(
+      "BOOL_TRUE", "true",
+      "BOOL_FALSE", "false",
+      "BOOL_NO", "no"
+    );
+    Arguments args = Arguments.of(env);
+    assertNull(args.getBooleanObject("BOOL_NULL", "test"));
+    assertEquals(true, args.getBooleanObject("BOOL_TRUE", "test"));
+    assertEquals(false, args.getBooleanObject("BOOL_FALSE", "test"));
+    assertEquals(false, args.getBooleanObject("BOOL_NO", "test"));
   }
 }

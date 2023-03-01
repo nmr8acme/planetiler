@@ -2,14 +2,23 @@ package com.onthegomap.planetiler.mbtiles;
 
 import static com.fasterxml.jackson.annotation.JsonInclude.Include.NON_ABSENT;
 
-import com.carrotsearch.hppc.IntIntHashMap;
+import com.carrotsearch.hppc.LongIntHashMap;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
+import com.onthegomap.planetiler.archive.ReadableTileArchive;
+import com.onthegomap.planetiler.archive.TileArchiveMetadata;
+import com.onthegomap.planetiler.archive.TileEncodingResult;
+import com.onthegomap.planetiler.archive.WriteableTileArchive;
+import com.onthegomap.planetiler.config.PlanetilerConfig;
 import com.onthegomap.planetiler.geo.GeoUtils;
 import com.onthegomap.planetiler.geo.TileCoord;
-import java.io.Closeable;
+import com.onthegomap.planetiler.geo.TileOrder;
+import com.onthegomap.planetiler.reader.FileFormatException;
+import com.onthegomap.planetiler.util.CloseableIterator;
+import com.onthegomap.planetiler.util.Format;
+import com.onthegomap.planetiler.util.LayerStats;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -22,13 +31,12 @@ import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 import java.util.stream.DoubleStream;
@@ -44,7 +52,7 @@ import org.sqlite.SQLiteConfig;
  *
  * @see <a href="https://github.com/mapbox/mbtiles-spec/blob/master/1.3/spec.md">MBTiles Specification</a>
  */
-public final class Mbtiles implements Closeable {
+public final class Mbtiles implements WriteableTileArchive, ReadableTileArchive {
 
   // https://www.sqlite.org/src/artifact?ci=trunk&filename=magic.txt
   private static final int MBTILES_APPLICATION_ID = 0x4d504258;
@@ -53,12 +61,6 @@ public final class Mbtiles implements Closeable {
   private static final String TILES_COL_X = "tile_column";
   private static final String TILES_COL_Y = "tile_row";
   private static final String TILES_COL_Z = "zoom_level";
-  public static final String ADD_TILE_INDEX_SQL = "create unique index tile_index on %s (%s, %s, %s)".formatted(
-    TILES_TABLE,
-    TILES_COL_Z,
-    TILES_COL_X,
-    TILES_COL_Y
-  );
   private static final String TILES_COL_DATA = "tile_data";
 
   private static final String TILES_DATA_TABLE = "tiles_data";
@@ -70,13 +72,6 @@ public final class Mbtiles implements Closeable {
   private static final String TILES_SHALLOW_COL_Y = TILES_COL_Y;
   private static final String TILES_SHALLOW_COL_Z = TILES_COL_Z;
   private static final String TILES_SHALLOW_COL_DATA_ID = TILES_DATA_COL_DATA_ID;
-  private static final String ADD_TILES_SHALLOW_INDEX_SQL =
-    "create unique index tiles_shallow_index on %s (%s, %s, %s)".formatted(
-      TILES_SHALLOW_TABLE,
-      TILES_SHALLOW_COL_Z,
-      TILES_SHALLOW_COL_X,
-      TILES_SHALLOW_COL_Y
-    );
 
   private static final String METADATA_TABLE = "metadata";
   private static final String METADATA_COL_NAME = "name";
@@ -97,8 +92,8 @@ public final class Mbtiles implements Closeable {
   }
 
   private final Connection connection;
-  private PreparedStatement getTileStatement = null;
   private final boolean compactDb;
+  private PreparedStatement getTileStatement = null;
 
   private Mbtiles(Connection connection, boolean compactDb) {
     this.connection = connection;
@@ -118,7 +113,7 @@ public final class Mbtiles implements Closeable {
 
   /** @see {@link #newInMemoryDatabase(boolean)} */
   public static Mbtiles newInMemoryDatabase() {
-    return newInMemoryDatabase(false);
+    return newInMemoryDatabase(true);
   }
 
   /** Returns a new connection to an mbtiles file optimized for fast bulk writes. */
@@ -157,6 +152,47 @@ public final class Mbtiles implements Closeable {
   }
 
   @Override
+  public TileOrder tileOrder() {
+    return TileOrder.TMS;
+  }
+
+  @Override
+  public void initialize(PlanetilerConfig config, TileArchiveMetadata tileArchiveMetadata, LayerStats layerStats) {
+    if (config.skipIndexCreation()) {
+      createTablesWithoutIndexes();
+      if (LOGGER.isInfoEnabled()) {
+        LOGGER.info("Skipping index creation. Add later by executing: {}",
+          String.join(" ; ", getManualIndexCreationStatements()));
+      }
+    } else {
+      createTablesWithIndexes();
+    }
+
+    var metadata = metadata()
+      .setName(tileArchiveMetadata.name())
+      .setFormat("pbf")
+      .setDescription(tileArchiveMetadata.description())
+      .setAttribution(tileArchiveMetadata.attribution())
+      .setVersion(tileArchiveMetadata.version())
+      .setType(tileArchiveMetadata.type())
+      .setBoundsAndCenter(config.bounds().latLon())
+      .setMinzoom(config.minzoom())
+      .setMaxzoom(config.maxzoom())
+      .setJson(new MetadataJson(layerStats.getTileStats()));
+
+    for (var entry : tileArchiveMetadata.planetilerSpecific().entrySet()) {
+      metadata.setMetadata(entry.getKey(), entry.getValue());
+    }
+  }
+
+  @Override
+  public void finish(PlanetilerConfig config) {
+    if (config.optimizeDb()) {
+      vacuumAnalyze();
+    }
+  }
+
+  @Override
   public void close() throws IOException {
     try {
       connection.close();
@@ -181,15 +217,20 @@ public final class Mbtiles implements Closeable {
     return execute(Arrays.asList(queries));
   }
 
-  public Mbtiles addTileIndex() {
-    if (compactDb) {
-      return execute(ADD_TILES_SHALLOW_INDEX_SQL);
-    } else {
-      return execute(ADD_TILE_INDEX_SQL);
-    }
+  /**
+   * Creates the required tables (and views) but skips index creation on some tables. Those indexes should be added
+   * later manually as described in {@code #getManualIndexCreationStatements()}.
+   */
+  public Mbtiles createTablesWithoutIndexes() {
+    return createTables(true);
   }
 
-  public Mbtiles createTables() {
+  /** Creates the required tables (and views) including all indexes. */
+  public Mbtiles createTablesWithIndexes() {
+    return createTables(false);
+  }
+
+  private Mbtiles createTables(boolean skipIndexCreation) {
 
     List<String> ddlStatements = new ArrayList<>();
 
@@ -199,6 +240,13 @@ public final class Mbtiles implements Closeable {
       .add("create unique index name on " + METADATA_TABLE + " (" + METADATA_COL_NAME + ");");
 
     if (compactDb) {
+      /*
+       * "primary key without rowid" results in a clustered index which is much more compact and performant (r/w)
+       * than "unique" which results in a non-clustered index
+       */
+      String tilesShallowPrimaryKeyAddition = skipIndexCreation ? "" : """
+        , primary key(%s,%s,%s)
+        """.formatted(TILES_SHALLOW_COL_Z, TILES_SHALLOW_COL_X, TILES_SHALLOW_COL_Y);
       ddlStatements
         .add("""
           create table %s (
@@ -206,9 +254,14 @@ public final class Mbtiles implements Closeable {
             %s integer,
             %s integer,
             %s integer
-          )
+
+            %s
+          ) %s
           """.formatted(TILES_SHALLOW_TABLE,
-          TILES_SHALLOW_COL_Z, TILES_SHALLOW_COL_X, TILES_SHALLOW_COL_Y, TILES_SHALLOW_COL_DATA_ID));
+          TILES_SHALLOW_COL_Z, TILES_SHALLOW_COL_X, TILES_SHALLOW_COL_Y, TILES_SHALLOW_COL_DATA_ID,
+          tilesShallowPrimaryKeyAddition,
+          skipIndexCreation ? "" : "without rowid"));
+      // here it's not worth to skip the "primary key"/index - doing so even hurts write performance
       ddlStatements.add("""
         create table %s (
           %s integer primary key,
@@ -234,12 +287,37 @@ public final class Mbtiles implements Closeable {
         TILES_DATA_TABLE, TILES_SHALLOW_TABLE, TILES_SHALLOW_COL_DATA_ID, TILES_DATA_TABLE, TILES_DATA_COL_DATA_ID
       ));
     } else {
-      ddlStatements.add("create table " + TILES_TABLE + " (" + TILES_COL_Z + " integer, " + TILES_COL_X + " integer, " +
-        TILES_COL_Y + ", " + TILES_COL_DATA + " blob);");
+      // here "primary key (with rowid)" is much more compact than a "primary key without rowid" because the tile data is part of the table
+      String tilesUniqueAddition = skipIndexCreation ? "" : """
+        , primary key(%s,%s,%s)
+        """.formatted(TILES_COL_Z, TILES_COL_X, TILES_COL_Y);
+      ddlStatements.add("""
+        create table %s (
+          %s integer,
+          %s integer,
+          %s integer,
+          %s blob
+          %s
+        )
+        """.formatted(TILES_TABLE, TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA, tilesUniqueAddition));
     }
 
-
     return execute(ddlStatements);
+  }
+
+  /** Returns the DDL statements to create the indexes manually when the option to skip index creation was chosen. */
+  public List<String> getManualIndexCreationStatements() {
+    if (compactDb) {
+      return List.of(
+        "create unique index tiles_shallow_index on %s (%s, %s, %s)"
+          .formatted(TILES_SHALLOW_TABLE, TILES_SHALLOW_COL_Z, TILES_SHALLOW_COL_X, TILES_SHALLOW_COL_Y)
+      );
+    } else {
+      return List.of(
+        "create unique index tile_index on %s (%s, %s, %s)"
+          .formatted(TILES_TABLE, TILES_COL_Z, TILES_COL_X, TILES_COL_Y)
+      );
+    }
   }
 
   public Mbtiles vacuumAnalyze() {
@@ -250,12 +328,17 @@ public final class Mbtiles implements Closeable {
   }
 
   /** Returns a writer that queues up inserts into the tile database(s) into large batches before executing them. */
-  public BatchedTileWriter newBatchedTileWriter() {
+  public WriteableTileArchive.TileWriter newTileWriter() {
     if (compactDb) {
       return new BatchedCompactTileWriter();
     } else {
       return new BatchedNonCompactTileWriter();
     }
+  }
+
+  // TODO: exists for compatibility purposes
+  public WriteableTileArchive.TileWriter newBatchedTileWriter() {
+    return newTileWriter();
   }
 
   /** Returns the contents of the metadata table. */
@@ -277,10 +360,7 @@ public final class Mbtiles implements Closeable {
     return getTileStatement;
   }
 
-  public byte[] getTile(TileCoord coord) {
-    return getTile(coord.x(), coord.y(), coord.z());
-  }
-
+  @Override
   public byte[] getTile(int x, int y, int z) {
     try {
       PreparedStatement stmt = getTileStatement();
@@ -295,22 +375,9 @@ public final class Mbtiles implements Closeable {
     }
   }
 
-  public List<TileCoord> getAllTileCoords() {
-    List<TileCoord> result = new ArrayList<>();
-    try (Statement statement = connection.createStatement()) {
-      ResultSet rs = statement.executeQuery(
-        "select %s, %s, %s, %s from %s".formatted(TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA, TILES_TABLE)
-      );
-      while (rs.next()) {
-        int z = rs.getInt(TILES_COL_Z);
-        int rawy = rs.getInt(TILES_COL_Y);
-        int x = rs.getInt(TILES_COL_X);
-        result.add(TileCoord.ofXYZ(x, (1 << z) - 1 - rawy, z));
-      }
-    } catch (SQLException throwables) {
-      throw new IllegalStateException("Could not get all tile coordinates", throwables);
-    }
-    return result;
+  @Override
+  public CloseableIterator<TileCoord> getAllTileCoords() {
+    return new TileCoordIterator();
   }
 
   public Connection connection() {
@@ -324,10 +391,10 @@ public final class Mbtiles implements Closeable {
    *      schema</a>
    */
   public record MetadataJson(
-    @JsonProperty("vector_layers") List<VectorLayer> vectorLayers
+    @JsonProperty("vector_layers") List<LayerStats.VectorLayer> vectorLayers
   ) {
 
-    public MetadataJson(VectorLayer... layers) {
+    public MetadataJson(LayerStats.VectorLayer... layers) {
       this(List.of(layers));
     }
 
@@ -344,55 +411,6 @@ public final class Mbtiles implements Closeable {
         return objectMapper.writeValueAsString(this);
       } catch (JsonProcessingException e) {
         throw new IllegalArgumentException("Unable to encode as string: " + this, e);
-      }
-    }
-
-    public enum FieldType {
-      @JsonProperty("Number")
-      NUMBER,
-      @JsonProperty("Boolean")
-      BOOLEAN,
-      @JsonProperty("String")
-      STRING;
-
-      /**
-       * Per the spec: attributes whose type varies between features SHOULD be listed as "String"
-       */
-      public static FieldType merge(FieldType oldValue, FieldType newValue) {
-        return oldValue != newValue ? STRING : newValue;
-      }
-    }
-
-    public record VectorLayer(
-      @JsonProperty("id") String id,
-      @JsonProperty("fields") Map<String, FieldType> fields,
-      @JsonProperty("description") Optional<String> description,
-      @JsonProperty("minzoom") OptionalInt minzoom,
-      @JsonProperty("maxzoom") OptionalInt maxzoom
-    ) {
-
-      public VectorLayer(String id, Map<String, FieldType> fields) {
-        this(id, fields, Optional.empty(), OptionalInt.empty(), OptionalInt.empty());
-      }
-
-      public VectorLayer(String id, Map<String, FieldType> fields, int minzoom, int maxzoom) {
-        this(id, fields, Optional.empty(), OptionalInt.of(minzoom), OptionalInt.of(maxzoom));
-      }
-
-      public static VectorLayer forLayer(String id) {
-        return new VectorLayer(id, new HashMap<>());
-      }
-
-      public VectorLayer withDescription(String newDescription) {
-        return new VectorLayer(id, fields, Optional.of(newDescription), minzoom, maxzoom);
-      }
-
-      public VectorLayer withMinzoom(int newMinzoom) {
-        return new VectorLayer(id, fields, description, OptionalInt.of(newMinzoom), maxzoom);
-      }
-
-      public VectorLayer withMaxzoom(int newMaxzoom) {
-        return new VectorLayer(id, fields, description, minzoom, OptionalInt.of(newMaxzoom));
       }
     }
   }
@@ -462,11 +480,67 @@ public final class Mbtiles implements Closeable {
       if (this == obj) {
         return true;
       }
-      if (!(obj instanceof TileDataEntry)) {
+      if (!(obj instanceof TileDataEntry other)) {
         return false;
       }
-      TileDataEntry other = (TileDataEntry) obj;
       return Arrays.equals(tileData, other.tileData) && tileDataId == other.tileDataId;
+    }
+  }
+
+  /** Iterates through tile coordinates one at a time without materializing the entire list in memory. */
+  private class TileCoordIterator implements CloseableIterator<TileCoord> {
+    private final Statement statement;
+    private final ResultSet rs;
+    private boolean hasNext = false;
+
+    private TileCoordIterator() {
+      try {
+        this.statement = connection.createStatement();
+        this.rs = statement.executeQuery(
+          "select %s, %s, %s, %s from %s".formatted(TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA, TILES_TABLE)
+        );
+        hasNext = rs.next();
+      } catch (SQLException e) {
+        throw new FileFormatException("Could not read tile coordinates from mbtiles file", e);
+      } finally {
+        if (!hasNext) {
+          close();
+        }
+      }
+    }
+
+    @Override
+    public void close() {
+      try {
+        statement.close();
+      } catch (SQLException e) {
+        throw new IllegalStateException("Could not close mbtiles file", e);
+      }
+    }
+
+    @Override
+    public boolean hasNext() {
+      return hasNext;
+    }
+
+    @Override
+    public TileCoord next() {
+      if (!hasNext()) {
+        throw new NoSuchElementException();
+      }
+      try {
+        int z = rs.getInt(TILES_COL_Z);
+        int rawy = rs.getInt(TILES_COL_Y);
+        int x = rs.getInt(TILES_COL_X);
+        var result = TileCoord.ofXYZ(x, (1 << z) - 1 - rawy, z);
+        hasNext = rs.next();
+        if (!hasNext) {
+          close();
+        }
+        return result;
+      } catch (SQLException e) {
+        throw new IllegalStateException("Could not read mbtiles file", e);
+      }
     }
   }
 
@@ -480,6 +554,7 @@ public final class Mbtiles implements Closeable {
     private final boolean insertStmtInsertIgnore;
     private final String insertStmtValuesPlaceHolder;
     private final String insertStmtColumnsCsv;
+    private long count = 0;
 
 
     protected BatchedTableWriterBase(String tableName, List<String> columns, boolean insertIgnore) {
@@ -494,6 +569,7 @@ public final class Mbtiles implements Closeable {
 
     /** Queue-up a write or flush to disk if enough are waiting. */
     void write(T item) {
+      count++;
       batch.add(item);
       if (batch.size() >= batchLimit) {
         flush(batchStatement);
@@ -530,6 +606,10 @@ public final class Mbtiles implements Closeable {
       } catch (SQLException throwables) {
         throw new IllegalStateException("Error flushing batch", throwables);
       }
+    }
+
+    public long count() {
+      return count;
     }
 
     @Override
@@ -622,18 +702,7 @@ public final class Mbtiles implements Closeable {
     }
   }
 
-
-  /**
-   * A high-throughput writer that accepts new tiles and queues up the writes to execute them in fewer large-batches.
-   */
-  public interface BatchedTileWriter extends AutoCloseable {
-    void write(TileEncodingResult encodingResult);
-
-    @Override
-    void close();
-  }
-
-  private class BatchedNonCompactTileWriter implements BatchedTileWriter {
+  private class BatchedNonCompactTileWriter implements TileWriter {
 
     private final BatchedTileTableWriter tableWriter = new BatchedTileTableWriter();
 
@@ -649,11 +718,11 @@ public final class Mbtiles implements Closeable {
 
   }
 
-  private class BatchedCompactTileWriter implements BatchedTileWriter {
+  private class BatchedCompactTileWriter implements TileWriter {
 
     private final BatchedTileShallowTableWriter batchedTileShallowTableWriter = new BatchedTileShallowTableWriter();
     private final BatchedTileDataTableWriter batchedTileDataTableWriter = new BatchedTileDataTableWriter();
-    private final IntIntHashMap tileDataIdByHash = new IntIntHashMap(1_000);
+    private final LongIntHashMap tileDataIdByHash = new LongIntHashMap(1_000);
 
     private int tileDataIdCounter = 1;
 
@@ -661,10 +730,10 @@ public final class Mbtiles implements Closeable {
     public void write(TileEncodingResult encodingResult) {
       int tileDataId;
       boolean writeData;
-      OptionalInt tileDataHashOpt = encodingResult.tileDataHash();
+      OptionalLong tileDataHashOpt = encodingResult.tileDataHash();
 
       if (tileDataHashOpt.isPresent()) {
-        int tileDataHash = tileDataHashOpt.getAsInt();
+        long tileDataHash = tileDataHashOpt.getAsLong();
         if (tileDataIdByHash.containsKey(tileDataHash)) {
           tileDataId = tileDataIdByHash.get(tileDataHash);
           writeData = false;
@@ -688,6 +757,17 @@ public final class Mbtiles implements Closeable {
       batchedTileShallowTableWriter.close();
       batchedTileDataTableWriter.close();
     }
+
+    @Override
+    public void printStats() {
+      if (LOGGER.isDebugEnabled()) {
+        var format = Format.defaultInstance();
+        LOGGER.debug("Shallow tiles written: {}", format.integer(batchedTileShallowTableWriter.count()));
+        LOGGER.debug("Tile data written: {} ({} omitted)", format.integer(batchedTileDataTableWriter.count()),
+          format.percent(1d - batchedTileDataTableWriter.count() * 1d / batchedTileShallowTableWriter.count()));
+        LOGGER.debug("Unique tile hashes: {}", format.integer(tileDataIdByHash.size()));
+      }
+    }
   }
 
 
@@ -706,13 +786,17 @@ public final class Mbtiles implements Closeable {
 
     public Metadata setMetadata(String name, Object value) {
       if (value != null) {
-        LOGGER.debug("Set mbtiles metadata: {}={}", name, value);
+        String stringValue = value.toString();
+        LOGGER.debug("Set mbtiles metadata: {}={}", name,
+          stringValue.length() > 1_000 ?
+            (stringValue.substring(0, 1_000) + "... " + (stringValue.length() - 1_000) + " more characters") :
+            stringValue);
         try (
           PreparedStatement statement = connection.prepareStatement(
             "INSERT INTO " + METADATA_TABLE + " (" + METADATA_COL_NAME + "," + METADATA_COL_VALUE + ") VALUES(?, ?);")
         ) {
           statement.setString(1, name);
-          statement.setString(2, value.toString());
+          statement.setString(2, stringValue);
           statement.execute();
         } catch (SQLException throwables) {
           LOGGER.error("Error setting metadata " + name + "=" + value, throwables);

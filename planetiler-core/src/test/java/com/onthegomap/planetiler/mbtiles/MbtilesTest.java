@@ -1,20 +1,21 @@
 package com.onthegomap.planetiler.mbtiles;
 
 import static com.onthegomap.planetiler.TestUtils.assertSameJson;
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.*;
 
 import com.google.common.math.IntMath;
 import com.onthegomap.planetiler.TestUtils;
+import com.onthegomap.planetiler.archive.TileEncodingResult;
 import com.onthegomap.planetiler.geo.GeoUtils;
 import com.onthegomap.planetiler.geo.TileCoord;
+import com.onthegomap.planetiler.util.LayerStats;
 import java.io.IOException;
 import java.math.RoundingMode;
 import java.sql.SQLException;
-import java.util.HashSet;
+import java.sql.Statement;
+import java.util.List;
 import java.util.Map;
-import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
@@ -34,16 +35,18 @@ class MbtilesTest {
 
   private static final
 
-    void testWriteTiles(int howMany, boolean deferIndexCreation, boolean optimize, boolean compactDb)
+    void testWriteTiles(int howMany, boolean skipIndexCreation, boolean optimize, boolean compactDb)
       throws IOException, SQLException {
     try (Mbtiles db = Mbtiles.newInMemoryDatabase(compactDb)) {
-      db.createTables();
-      if (!deferIndexCreation) {
-        db.addTileIndex();
+      if (skipIndexCreation) {
+        db.createTablesWithoutIndexes();
+      } else {
+        db.createTablesWithIndexes();
       }
+
       assertNull(db.getTile(0, 0, 0));
       Set<Mbtiles.TileEntry> expected = new TreeSet<>();
-      try (var writer = db.newBatchedTileWriter()) {
+      try (var writer = db.newTileWriter()) {
         for (int i = 0; i < howMany; i++) {
           var dataHash = i - (i % 2);
           var dataBase = howMany + dataHash;
@@ -53,13 +56,11 @@ class MbtilesTest {
             (byte) (dataBase >> 16),
             (byte) (dataBase >> 24)
           });
-          writer.write(new TileEncodingResult(entry.tile(), entry.bytes(), OptionalInt.of(dataHash)));
+          writer.write(new TileEncodingResult(entry.tile(), entry.bytes(), OptionalLong.of(dataHash)));
           expected.add(entry);
         }
       }
-      if (deferIndexCreation) {
-        db.addTileIndex();
-      }
+
       if (optimize) {
         db.vacuumAnalyze();
       }
@@ -67,7 +68,7 @@ class MbtilesTest {
       assertEquals(howMany, all.size());
       assertEquals(expected, all);
       assertEquals(expected.stream().map(Mbtiles.TileEntry::tile).collect(Collectors.toSet()),
-        new HashSet<>(db.getAllTileCoords()));
+        db.getAllTileCoords().stream().collect(Collectors.toSet()));
       for (var expectedEntry : expected) {
         var tile = expectedEntry.tile();
         byte[] data = db.getTile(tile.x(), tile.y(), tile.z());
@@ -94,7 +95,7 @@ class MbtilesTest {
   }
 
   @Test
-  void testDeferIndexCreation() throws IOException, SQLException {
+  void testSkipIndexCreation() throws IOException, SQLException {
     testWriteTiles(10, true, false, false);
   }
 
@@ -103,11 +104,27 @@ class MbtilesTest {
     testWriteTiles(10, false, true, false);
   }
 
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void testManualIndexCreationStatements(boolean compactDb) throws IOException, SQLException {
+    try (Mbtiles db = Mbtiles.newInMemoryDatabase(compactDb)) {
+      db.createTablesWithoutIndexes();
+
+      List<String> indexCreationStmts = db.getManualIndexCreationStatements();
+      assertFalse(indexCreationStmts.isEmpty());
+      for (String indexCreationStmt : indexCreationStmts) {
+        try (Statement stmt = db.connection().createStatement()) {
+          assertDoesNotThrow(() -> stmt.execute(indexCreationStmt));
+        }
+      }
+    }
+  }
+
   @Test
   void testAddMetadata() throws IOException {
     Map<String, String> expected = new TreeMap<>();
     try (Mbtiles db = Mbtiles.newInMemoryDatabase()) {
-      var metadata = db.createTables().metadata();
+      var metadata = db.createTablesWithoutIndexes().metadata();
       metadata.setName("name value");
       expected.put("name", "name value");
 
@@ -144,7 +161,7 @@ class MbtilesTest {
   void testAddMetadataWorldBounds() throws IOException {
     Map<String, String> expected = new TreeMap<>();
     try (Mbtiles db = Mbtiles.newInMemoryDatabase()) {
-      var metadata = db.createTables().metadata();
+      var metadata = db.createTablesWithoutIndexes().metadata();
       metadata.setBoundsAndCenter(GeoUtils.WORLD_LAT_LON_BOUNDS);
       expected.put("bounds", "-180,-85.05113,180,85.05113");
       expected.put("center", "0,0,0");
@@ -157,7 +174,7 @@ class MbtilesTest {
   void testAddMetadataSmallBounds() throws IOException {
     Map<String, String> expected = new TreeMap<>();
     try (Mbtiles db = Mbtiles.newInMemoryDatabase()) {
-      var metadata = db.createTables().metadata();
+      var metadata = db.createTablesWithoutIndexes().metadata();
       metadata.setBoundsAndCenter(new Envelope(-73.6632, -69.7598, 41.1274, 43.0185));
       expected.put("bounds", "-73.6632,41.1274,-69.7598,43.0185");
       expected.put("center", "-71.7115,42.07295,7");
@@ -168,7 +185,7 @@ class MbtilesTest {
 
   private void testMetadataJson(Mbtiles.MetadataJson object, String expected) throws IOException {
     try (Mbtiles db = Mbtiles.newInMemoryDatabase()) {
-      var metadata = db.createTables().metadata();
+      var metadata = db.createTablesWithoutIndexes().metadata();
       metadata.setJson(object);
       var actual = metadata.getAll().get("json");
       assertSameJson(expected, actual);
@@ -187,17 +204,17 @@ class MbtilesTest {
   @Test
   void testFullMetadataJson() throws IOException {
     testMetadataJson(new Mbtiles.MetadataJson(
-      new Mbtiles.MetadataJson.VectorLayer(
+      new LayerStats.VectorLayer(
         "full",
         Map.of(
-          "NUMBER_FIELD", Mbtiles.MetadataJson.FieldType.NUMBER,
-          "STRING_FIELD", Mbtiles.MetadataJson.FieldType.STRING,
-          "boolean field", Mbtiles.MetadataJson.FieldType.BOOLEAN
+          "NUMBER_FIELD", LayerStats.FieldType.NUMBER,
+          "STRING_FIELD", LayerStats.FieldType.STRING,
+          "boolean field", LayerStats.FieldType.BOOLEAN
         )
       ).withDescription("full description")
         .withMinzoom(0)
         .withMaxzoom(5),
-      new Mbtiles.MetadataJson.VectorLayer(
+      new LayerStats.VectorLayer(
         "partial",
         Map.of()
       )

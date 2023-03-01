@@ -5,7 +5,6 @@ import static com.onthegomap.planetiler.worker.Worker.joinFutures;
 
 import com.carrotsearch.hppc.IntObjectHashMap;
 import com.carrotsearch.hppc.LongArrayList;
-import com.carrotsearch.hppc.LongHashSet;
 import com.carrotsearch.hppc.LongObjectHashMap;
 import com.carrotsearch.hppc.ObjectIntHashMap;
 import com.onthegomap.planetiler.FeatureCollector;
@@ -53,6 +52,7 @@ import org.locationtech.jts.geom.Point;
 import org.locationtech.jts.geom.Polygon;
 import org.locationtech.jts.geom.impl.CoordinateArraySequence;
 import org.locationtech.jts.geom.impl.PackedCoordinateSequence;
+import org.roaringbitmap.longlong.Roaring64Bitmap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -86,7 +86,7 @@ public class OsmReader implements Closeable, MemoryEstimator.HasEstimate {
   private final Object wayToRelationsLock = new Object();
   // for multipolygons need to store way info (20m ways, 800m nodes) to use when processing relations (4.5m)
   // ~300mb
-  private LongHashSet waysInMultipolygon = new LongHashSet();
+  private Roaring64Bitmap waysInMultipolygon = new Roaring64Bitmap();
   private final Object waysInMultipolygonLock = new Object();
   // ~7GB
   private LongLongMultimap.Replaceable multipolygonWayGeometries;
@@ -541,7 +541,7 @@ public class OsmReader implements Closeable, MemoryEstimator.HasEstimate {
   @Override
   public long estimateMemoryUsageBytes() {
     long size = 0;
-    size += estimateSize(waysInMultipolygon);
+    size += waysInMultipolygon == null ? 0 : waysInMultipolygon.serializedSizeInBytes();
     // multipolygonWayGeometries is reported separately
     size += estimateSize(wayToRelations);
     size += estimateSize(relationInfo);
@@ -621,17 +621,20 @@ public class OsmReader implements Closeable, MemoryEstimator.HasEstimate {
    * A source feature generated from OSM elements. Inferring the geometry can be expensive, so each subclass is
    * constructed with the inputs necessary to create the geometry, but the geometry is constructed lazily on read.
    */
-  private abstract class OsmFeature extends SourceFeature {
+  private abstract class OsmFeature extends SourceFeature implements OsmSourceFeature {
 
+    private final OsmElement originalElement;
     private final boolean polygon;
     private final boolean line;
     private final boolean point;
     private Geometry latLonGeom;
     private Geometry worldGeom;
 
+
     public OsmFeature(OsmElement elem, boolean point, boolean line, boolean polygon,
       List<RelationMember<OsmRelationInfo>> relationInfo) {
       super(elem.tags(), name, null, relationInfo, elem.id());
+      this.originalElement = elem;
       this.point = point;
       this.line = line;
       this.polygon = polygon;
@@ -662,6 +665,11 @@ public class OsmReader implements Closeable, MemoryEstimator.HasEstimate {
     @Override
     public boolean canBePolygon() {
       return polygon;
+    }
+
+    @Override
+    public OsmElement originalElement() {
+      return originalElement;
     }
   }
 
